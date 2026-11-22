@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -101,12 +102,20 @@ def score_from_heatmap(info, n):
     return score
 
 
-def score_from_audio(url, work, n):
-    """Fallback: loudness per second."""
-    log("downloading audio for loudness analysis (this can take a while on long videos)")
-    opts = ydl_opts(quiet=True, no_warnings=True, format="ba/b",
-                    outtmpl=str(work / "audio.%(ext)s"), noplaylist=True)
-    with yt_dlp.YoutubeDL(opts) as ydl:
+def score_from_audio(url, work, cache, n, lo=0, hi=None):
+    """Fallback: loudness per second. Only the part between lo and hi is downloaded."""
+    hi = n if hi is None else hi
+    cached = cache / f"loudness_{lo}_{hi}.npy"
+    if cached.exists():
+        log("using the saved loudness analysis from an earlier run")
+        return np.load(cached)
+    log(f"downloading the audio between {mmss(lo)} and {mmss(hi)} to find the loudest moments "
+        "(a long stretch takes a while; the result is saved for next time)")
+    opts = dict(quiet=True, no_warnings=True, format="wa/ba/b",  # smallest audio is enough for loudness
+                outtmpl=str(work / "audio.%(ext)s"), noplaylist=True)
+    if (lo, hi) != (0, n):
+        opts["download_ranges"] = download_range_func(None, [(lo, hi)])
+    with yt_dlp.YoutubeDL(ydl_opts(**opts)) as ydl:
         ydl.download([url])
     f = next(work.glob("audio.*"))
     raw = subprocess.run(
@@ -117,17 +126,23 @@ def score_from_audio(url, work, n):
     secs = len(x) // 8000
     rms = np.sqrt((x[: secs * 8000].reshape(secs, 8000) ** 2).mean(axis=1))
     out = np.zeros(n)
-    out[: min(n, secs)] = rms[:n]
+    seg = rms[: max(0, min(hi - lo, n - lo))]
+    out[lo: lo + len(seg)] = seg
+    np.save(cached, out)
     return out
 
 
-def top_windows(score, win, count):
-    """Start times of the `count` best non-overlapping windows, best first."""
+def top_windows(score, win, count, lo=0, hi=None):
+    """Start times of the `count` best non-overlapping windows, best first.
+    Only windows that lie fully inside [lo, hi] are considered."""
     n = len(score)
     if n <= win:
         return [0]
+    hi = n if hi is None else min(hi, n)
     cs = np.concatenate([[0], np.cumsum(score)])
     sums = (cs[win:] - cs[:-win]).astype(float)
+    sums[:lo] = -np.inf
+    sums[max(hi - win + 1, 0):] = -np.inf
     starts = []
     for _ in range(count):
         i = int(np.argmax(sums))
@@ -140,10 +155,11 @@ def top_windows(score, win, count):
         i = (i + j) // 2
         starts.append(i)
         sums[max(0, i - win + 1): i + win] = -np.inf
-    return starts or [0]
+    return starts or [lo]
 
 
-def find_windows(url, info, work, cache, total, win, count, source):
+def find_windows(url, info, work, cache, total, win, count, source, rng=None):
+    lo, hi = rng or (0, total)
     order = {
         "auto": (["chat"] if info.get("was_live") else []) + ["heatmap", "audio"],
         "chat": ["chat", "heatmap", "audio"],
@@ -156,11 +172,11 @@ def find_windows(url, info, work, cache, total, win, count, source):
         elif method == "heatmap":
             s, label = score_from_heatmap(info, total), "most replayed"
         else:
-            s, label = score_from_audio(url, work, total), "loudest audio"
+            s, label = score_from_audio(url, work, cache, total, lo, hi), "loudest audio"
         if s is not None:
-            return top_windows(s, win, count), label
+            return top_windows(s, win, count, lo, hi), label
         log(f"no usable {method} data, trying the next method")
-    return [0], "start of the video"
+    return [lo], "start of the range"
 
 
 # ------------------------------------------------------------------ download
@@ -347,7 +363,7 @@ def pick_model(model, on_gpu):
 _MODELS = {}
 
 
-def run_whisper(audio, model_size, device, compute_type, language=None, prompt=None):
+def run_whisper(audio, model_size, device, compute_type, language=None, prompt=None, english_only=False):
     add_cuda_dll_paths()
     from faster_whisper import WhisperModel
 
@@ -371,8 +387,11 @@ def run_whisper(audio, model_size, device, compute_type, language=None, prompt=N
         hallucination_silence_threshold=2.0,    # drops made-up text over silence/music
         initial_prompt=prompt,
     )
+    lang = language or info.language
     if language is None:
         log(f"detected language: {info.language} ({info.language_probability:.0%})")
+        if english_only and info.language != "en":
+            return [], info.language  # not English: skip the slow transcription entirely
     words = []
     for seg in segments:
         if seg.no_speech_prob > 0.6 and seg.avg_logprob < -1.0:
@@ -383,18 +402,19 @@ def run_whisper(audio, model_size, device, compute_type, language=None, prompt=N
             text = w.word.strip()
             if text:
                 words.append((w.start, w.end, text))
-    return words
+    return words, lang
 
 
-def transcribe_words(clip, model="auto", device="auto", language=None, prompt=None):
+def transcribe_words(clip, model="auto", device="auto", language=None, prompt=None, english_only=False):
+    """Returns (words, language). With english_only, speech in any other language gives no words."""
     audio = load_audio(clip)
     gpu = device == "cuda" or (device == "auto" and has_gpu())
     if gpu:
         try:
-            return run_whisper(audio, pick_model(model, True), "cuda", "auto", language, prompt)
+            return run_whisper(audio, pick_model(model, True), "cuda", "auto", language, prompt, english_only)
         except RuntimeError as e:
             log(f"GPU transcription failed ({e}); retrying on CPU")
-    return run_whisper(audio, pick_model(model, False), "cpu", "int8", language, prompt)
+    return run_whisper(audio, pick_model(model, False), "cpu", "int8", language, prompt, english_only)
 
 
 # ---------------------------------------------------------- fonts / captions
@@ -599,6 +619,38 @@ def parse_duration(v, bare="seconds"):
     return secs
 
 
+def parse_time(v):
+    """1:30:00, 90:00, 1h30m, 90m, 5400 (seconds)."""
+    t = str(v).strip().lower().replace(" ", "")
+    err = ValueError("Times look like 1:30:00, 90:00, 1h30m, 90m or 5400 (seconds).")
+    if re.fullmatch(r"\d+(\.\d+)?", t):
+        return float(t)
+    if ":" in t:
+        parts = t.split(":")
+        if len(parts) not in (2, 3) or not all(re.fullmatch(r"\d+(\.\d+)?", q) for q in parts):
+            raise err
+        secs = 0.0
+        for q in parts:
+            secs = secs * 60 + float(q)
+        return secs
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", t)
+    if m and any(m.groups()):
+        return int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + int(m.group(3) or 0)
+    raise err
+
+
+def parse_range(v):
+    """'1h30m-3h' -> (5400, 10800); '2h-' = from 2h to the end; '-1h' = the first hour."""
+    if "-" not in str(v):
+        raise ValueError("Use start-end, for example 1h30m-3h or 1:30:00-3:00:00.")
+    a, b = str(v).split("-", 1)
+    lo = parse_time(a) if a.strip() else 0
+    hi = parse_time(b) if b.strip() else None
+    if hi is not None and hi <= lo:
+        raise ValueError("The end of the range must come after the start.")
+    return lo, hi
+
+
 def parse_show(v):
     table = {"1": "both", "both": "both", "b": "both",
              "2": "cam", "cam": "cam", "webcam": "cam", "facecam": "cam", "face": "cam",
@@ -671,9 +723,13 @@ def build_parser():
     ap.add_argument("--subs", type=as_arg(parse_yes_no), help="subtitles: yes or no")
     ap.add_argument("--no-subs", dest="subs", action="store_const", const="no", help="same as --subs no")
     ap.add_argument("--yes", action="store_true", help="don't ask questions, use defaults for anything not given")
-    ap.add_argument("--start", type=float, help="skip detection and make ONE clip starting at this second")
+    ap.add_argument("--start", type=as_arg(parse_time), metavar="TIME",
+                    help="skip detection and make ONE clip starting here, e.g. 1:23:45, 1h23m or 5025 (seconds)")
     ap.add_argument("--source", choices=["auto", "chat", "heatmap", "audio"], default="auto",
                     help="how to find the best moments. 'heatmap' is much faster than 'chat' on long streams")
+    ap.add_argument("--range", type=as_arg(parse_range), metavar="START-END",
+                    help="only look for moments in this part of a long video, e.g. 1h30m-3h "
+                         "(with the loudness method only that part is downloaded)")
     ap.add_argument("--out-dir", help="folder for the clips (default: clips_<video id>)")
 
     g = ap.add_argument_group("webcam and gameplay")
@@ -702,7 +758,11 @@ def build_parser():
     g.add_argument("--model", default="auto",
                    help="speech model: auto (large-v3-turbo on GPU, medium on CPU), or tiny/base/small/"
                         "medium/large-v3/large-v3-turbo")
-    g.add_argument("--language", help="spoken language code, e.g. en or bn (default: detect per clip)")
+    g.add_argument("--language", help="force the spoken language, e.g. en or bn (default: detect per clip). "
+                                      "A language other than en also turns the English-only rule off")
+    g.add_argument("--any-language", action="store_true",
+                   help="add subtitles in whatever language is spoken (default: clips that are not in "
+                        "English get no subtitles)")
     g.add_argument("--prompt", help="words the speech model should know: names, game terms, slang")
     g.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
                    help="where to run speech recognition (default auto, falls back to cpu)")
@@ -763,6 +823,7 @@ def main():
         log('tip: if downloads fail or only give audio, run: python -m pip install -U "yt-dlp[default]"')
 
     shows = {"both": "gameplay + webcam", "cam": "only the webcam", "game": "only the gameplay"}
+    english_only = not args.any_language and args.language in (None, "en")
     log(f"settings: {'1 clip' if args.start is not None else str(args.count) + ' clips'} of "
         f"{fmt_len(args.duration)}, {shows[args.show]}, subtitles {args.subs}"
         + (", logo on" if logo else ""))
@@ -773,6 +834,19 @@ def main():
         sys.exit("This stream is still live. Run the tool again once it has ended and the VOD is available.")
     total = int(info["duration"])
     win = min(args.duration, total)
+    rng = None
+    if args.range and args.start is None:
+        lo = int(max(0, args.range[0]))
+        hi = int(min(total, args.range[1] if args.range[1] is not None else total))
+        if lo >= total:
+            sys.exit(f"The range starts after the end of the video ({mmss(total)} long).")
+        if hi - lo < win:
+            sys.exit(f"The range {mmss(lo)} to {mmss(hi)} is shorter than one clip ({fmt_len(win)}).")
+        rng = (lo, hi)
+        log(f"only looking between {mmss(lo)} and {mmss(hi)} (video is {mmss(total)} long)")
+    elif total > 2 * 3600:
+        log(f"this video is {mmss(total)} long, so analysis can take a while. "
+            "To go faster: --source heatmap, or --range 1h-2h30m to search only part of it")
 
     cache = Path.home() / ".clipper_cache" / info["id"]
     cache.mkdir(parents=True, exist_ok=True)
@@ -780,13 +854,14 @@ def main():
     out_dir = Path(args.out_dir or f"clips_{info['id']}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     results, starts = [], []
+    t_run = time.time()
     pool = None
     face_info, cam_tries = None, 0
     try:
         if args.start is not None:
             starts, method = [args.start], "manual start"
         else:
-            starts, method = find_windows(args.url, info, work, cache, total, win, args.count, args.source)
+            starts, method = find_windows(args.url, info, work, cache, total, win, args.count, args.source, rng)
         starts = [max(0, min(s, total - win)) for s in starts]
         log(f"found {len(starts)} clip(s) by {method}; saving to {out_dir}")
         for rank, s in enumerate(starts, 1):
@@ -803,6 +878,7 @@ def main():
 
         for rank, start in enumerate(starts, 1):
             cdir = cdirs[rank]
+            t_clip = time.time()
             log(f"--- clip {rank}/{len(starts)}: {mmss(start)} to {mmss(start + win)} ---")
             try:
                 if not downloads[rank].done():
@@ -831,7 +907,8 @@ def main():
                 ass_name, fonts_dir = None, None
                 if args.subs == "yes":
                     log("transcribing")
-                    words = transcribe_words(clip, args.model, args.device, args.language, args.prompt)
+                    words, lang = transcribe_words(clip, args.model, args.device, args.language,
+                                                   args.prompt, english_only)
                     if words:
                         write_ass(words, cdir / "subs.ass", geo["sub_y"], font_name, args.sub_size, color, bold)
                         ass_name = "subs.ass"
@@ -839,6 +916,8 @@ def main():
                             (cdir / "fonts").mkdir(exist_ok=True)
                             shutil.copy(font_src, cdir / "fonts" / font_src.name)
                             fonts_dir = "fonts"
+                    elif english_only and lang not in (None, "en"):
+                        log(f"the speech is not English (detected: {lang}), so no subtitles on this clip")
                     else:
                         log("no speech detected, skipping subtitles")
 
@@ -846,7 +925,7 @@ def main():
                 log("rendering")
                 compose(clip.name, ass_name, logo, out, show, cam, geo, args.game_mode, game_h,
                         args.game_focus, cdir, fonts_dir)
-                log(f"saved {out.name}")
+                log(f"saved {out.name} (took {fmt_len(time.time() - t_clip)})")
                 results.append((rank, start, out))
             except Exception as e:  # one bad clip should not stop the rest
                 log(f"clip {rank} failed: {e}")
@@ -857,7 +936,7 @@ def main():
             pool.shutdown(wait=False, cancel_futures=True)
         shutil.rmtree(work, ignore_errors=True)
 
-    log(f"done: {len(results)} of {len(starts)} clips saved in {out_dir}")
+    log(f"done: {len(results)} of {len(starts)} clips saved in {out_dir} (total {fmt_len(time.time() - t_run)})")
     for rank, start, out in results:
         log(f"  #{rank}  {mmss(start)}  {out.name}")
 
